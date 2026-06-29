@@ -1,8 +1,0 @@
-streamlit
-pandas
-numpy
-yfinance
-aiohttp
-openpyxl
-matplotlib
-pyarrow
