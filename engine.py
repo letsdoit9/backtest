@@ -55,7 +55,7 @@ def _condition_flags_for_reporting(row_vals):
     flags[9] = low > prev_high
     flags[10] = price >= (0.97 * high_current)
     flags[11] = price >= (0.95 * high_52w)
-    flags[12] = (atr / price) < 0.06 if price else False
+    flags[12] = (atr / price) < 0.06 if price > 0 else False
     flags[13] = volume > (2 * vol_sma50) and (prev_close and (price - prev_close) / prev_close > 0.02)
     flags[14] = price > prev_close * 1.01
     flags[15] = volume > vol_sma50 * 1.5
@@ -94,13 +94,23 @@ def generate_signals_for_stock(symbol, hist_data, sector="Unknown",
         today = df.iloc[i]
         yesterday = df.iloc[i - 1]
 
+        today_close = safe_val(today["Close"])
+        today_atr = safe_val(today["ATR"], 0.5)
+        # Guard only: never feed a zero/negative price into the live scanner's
+        # check_conditions_vectorized (which divides atr/price). This does not
+        # alter any condition logic -- it just skips unusable data rows
+        # (e.g. corrupted/missing bars) the same way a live quote feed would
+        # never serve a zero price.
+        if today_close <= 0 or today_atr <= 0:
+            continue
+
         row_vals = (
-            safe_val(today["Close"]), safe_val(today["EMA5"]), safe_val(today["EMA13"]),
+            today_close, safe_val(today["EMA5"]), safe_val(today["EMA13"]),
             safe_val(today["EMA26"]), safe_val(today["SMA50"]), safe_val(today["SMA100"]),
             safe_val(today["SMA200"]), safe_val(today["RSI"], 50), safe_val(today["StochRSI"], 50),
             safe_val(today["MACD"]), safe_val(today["MACD_Signal"]), safe_val(today["Volume"]),
-            safe_val(today["Volume_SMA50"]), safe_val(today["ATR"], 0.5),
-            safe_val(today["BB_Upper"], safe_val(today["Close"])), safe_val(today["High_200"]),
+            safe_val(today["Volume_SMA50"]), today_atr,
+            safe_val(today["BB_Upper"], today_close), safe_val(today["High_200"]),
             safe_val(today["High_52w"]), safe_val(today["Open"]), safe_val(today["Low"]),
             safe_val(yesterday["High"]), safe_val(yesterday["Close"]), safe_val(today["High"]),
         )
