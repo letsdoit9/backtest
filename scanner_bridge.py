@@ -19,6 +19,7 @@ No line of the live scanner is copied, edited, or reimplemented here.
 """
 
 import importlib.util
+import os
 import sys
 import types
 
@@ -36,6 +37,20 @@ _REQUIRED_NAMES = [
 
 
 def _load_scanner_module() -> types.ModuleType:
+    if not os.path.exists(SCANNER_PATH):
+        cwd_listing = []
+        try:
+            cwd_listing = sorted(os.listdir(os.path.dirname(SCANNER_PATH) or "."))
+        except Exception:
+            pass
+        raise FileNotFoundError(
+            f"\n\nLive scanner file not found at:\n  {SCANNER_PATH}\n\n"
+            f"Files found in that directory instead:\n  {cwd_listing}\n\n"
+            f"Fix this by either:\n"
+            f"  1. Renaming/placing your scanner file at the path above, or\n"
+            f"  2. Setting the SCANNER_PATH environment variable (or Streamlit secret) "
+            f"to the correct absolute path of your scanner .py file.\n"
+        )
     spec = importlib.util.spec_from_file_location("live_upstox_scanner", SCANNER_PATH)
     if spec is None or spec.loader is None:
         raise ImportError(
