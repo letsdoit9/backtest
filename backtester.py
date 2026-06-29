@@ -1,419 +1,221 @@
 """
-backtester.py  —  Streamlit UI version
+backtester.py  (UPDATED)
+------------------------
+Main orchestrator for the Upstox Elite Swing Scanner Backtesting Engine.
+
+Usage:
+    python backtester.py --min-conditions 12 --max-workers 8
+    python backtester.py --full-optimization   # threshold/ATR/holding/sensitivity sweeps
+
+CHANGES:
+- Imports best_condition_combos from analytics and runs it after condition_analysis.
+- Passes condition_combos_df to write_excel_report and write_csv_outputs.
+- Returns condition_combos in the results dict.
+- generate_all_charts now receives trades_df for the new condition-pairs chart.
 """
 
+import argparse
 import time
-import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
-import numpy as np
 
 import config
 from utils import load_universe, get_historical_data, warmup_start_date
 from engine import generate_all_signals
 from trade_executor import execute_trades
 from metrics import build_equity_curve, performance_summary, monthly_analysis, yearly_analysis
-from analytics import sector_analysis, condition_analysis
+from analytics import (
+    sector_analysis,
+    condition_analysis,
+    best_condition_combos,          # NEW
+    threshold_analysis,
+    atr_optimization,
+    holding_period_optimization,
+    sensitivity_analysis,
+)
 from excel_export import write_excel_report, write_csv_outputs, write_performance_json
 from charts import generate_all_charts
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Swing Scanner Backtester", page_icon="📈", layout="wide")
 
-st.title("📈 Upstox Elite Swing Scanner — Backtester")
-st.markdown("---")
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Universe load ─────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Universe load ho raha hai...")
-def get_universe():
-    return load_universe()
-
-universe_df = get_universe()
-all_symbols = sorted(universe_df["tradingsymbol"].str.upper().tolist())
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ Settings")
-
-    mode = st.radio(
-        "Backtest mode:",
-        ["🎯 Specific stocks chunno", "🌐 Poora universe (slow)"],
-        index=0,
-    )
-
-    selected_symbols = []
-
-    if mode == "🎯 Specific stocks chunno":
-        manual_input = st.text_input(
-            "Stock symbols (NSE) — comma se alag karo:",
-            placeholder="e.g. RELIANCE,TCS,INFY",
-        )
-        dropdown_selected = st.multiselect(
-            "Ya yahan se select karo:",
-            options=all_symbols,
-            placeholder="Type karke search karo...",
-        )
-        manual_list = [s.strip().upper() for s in manual_input.split(",") if s.strip()] if manual_input else []
-        selected_symbols = list(dict.fromkeys(manual_list + dropdown_selected))
-
-        if selected_symbols:
-            st.success(f"✅ {len(selected_symbols)} stock(s) selected:")
-            for sym in selected_symbols:
-                st.markdown(f"  • **{sym}**")
-        else:
-            st.warning("⚠️ Koi stock select nahi kiya")
-
-    st.markdown("---")
-    st.subheader("📊 Backtest Parameters")
-
-    min_conditions = st.slider("Min Conditions (threshold):", 8, 16, config.DEFAULT_MIN_CONDITIONS)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        target1_mult = st.number_input("Target 1 (ATR×)", value=float(config.TARGET1_ATR_MULT), step=0.25, min_value=0.5)
-        target2_mult = st.number_input("Target 2 (ATR×)", value=float(config.TARGET2_ATR_MULT), step=0.25, min_value=0.5)
-    with col2:
-        stop_mult = st.number_input("Stoploss (ATR×)", value=float(config.STOPLOSS_ATR_MULT), step=0.25, min_value=0.25)
-        max_hold  = st.number_input("Max Holding Days", value=int(config.MAX_HOLDING_DAYS), step=1, min_value=1)
-
-    st.markdown("---")
-    st.subheader("💰 Position Sizing")
-    capital            = st.number_input("Aapka Capital (₹)", value=100000, step=10000, min_value=1000)
-    risk_per_trade_pct = st.slider("Risk per Trade (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5,
-                                    help="Ek trade mein apne capital ka kitna % risk karoge")
-
-    st.markdown("---")
-    run_btn = st.button("🚀 Backtest Chalao!", type="primary", use_container_width=True)
-
-# ── Helper: colour ReturnPct column ──────────────────────────────────────────
-def _colour_return(val):
-    """Pandas Styler map function — green for positive, red for negative."""
-    try:
-        num = float(str(val).replace("%", "").replace("₹", "").strip())
-        if num > 0:
-            return "color: green; font-weight: bold"
-        elif num < 0:
-            return "color: red; font-weight: bold"
-    except Exception:
-        pass
-    return ""
-
-# ── Helper: Position Sizing ───────────────────────────────────────────────────
-def position_sizing_recommendation(trades_df, cap, risk_pct, sl_mult):
-    if trades_df.empty:
-        return pd.DataFrame()
-    df = trades_df.copy()
-    risk_amount           = cap * (risk_pct / 100.0)
-    df["StopDistance_Rs"] = (df["EntryPrice"] - df["Stoploss"]).round(2)
-    df["StopDistance_Rs"] = df["StopDistance_Rs"].replace(0, np.nan)
-    df["RiskAmount_Rs"]   = round(risk_amount, 2)
-    df["RecommendedQty"]  = np.floor(risk_amount / df["StopDistance_Rs"]).fillna(0).astype(int)
-    df["PositionValue_Rs"]= (df["RecommendedQty"] * df["EntryPrice"]).round(2)
-    df["CapitalUsed_%"]   = (df["PositionValue_Rs"] / cap * 100.0).round(2)
-    return df[["Ticker", "SignalDate", "EntryPrice", "Stoploss", "Target1", "Target2",
-               "StopDistance_Rs", "RiskAmount_Rs", "RecommendedQty",
-               "PositionValue_Rs", "CapitalUsed_%", "ReturnPct", "ExitReason"]]
-
-# ── Main area ─────────────────────────────────────────────────────────────────
-if not run_btn:
-    st.info("👈 Left sidebar mein stocks select karo, phir **'Backtest Chalao!'** button dabaao.")
-    st.markdown("### Kaise use karein:")
-    st.markdown("""
-    1. **Sidebar** mein **'Specific stocks chunno'** mode select karo
-    2. Stock ka naam type karo (e.g. `RELIANCE`) ya dropdown se select karo
-    3. Capital aur Risk % set karo position sizing ke liye
-    4. **🚀 Backtest Chalao!** button dabaao
-    5. Results neeche aayenge — Excel/CSV download kar sakte ho
-    """)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Stocks Available", len(all_symbols))
-    c2.metric("Default Threshold", f"{config.DEFAULT_MIN_CONDITIONS}/16")
-    c3.metric("Backtest Start", config.BACKTEST_START_DATE)
-
-else:
-    # ── Validation ────────────────────────────────────────────────────────────
-    if mode == "🎯 Specific stocks chunno" and not selected_symbols:
-        st.error("❌ Koi stock select nahi kiya! Pehle sidebar mein stock chunno.")
-        st.stop()
-
-    symbols_to_run = selected_symbols if mode == "🎯 Specific stocks chunno" else all_symbols
-    label = ', '.join(symbols_to_run) if len(symbols_to_run) <= 10 else f"{len(symbols_to_run)} stocks"
-    st.subheader(f"{'🎯' if selected_symbols else '🌐'} Backtest: {label}")
-
-    progress_bar = st.progress(0, text="Shuru ho raha hai...")
-    status_box   = st.empty()
-    t0           = time.time()
-
-    # ── Step 1: Data fetch ────────────────────────────────────────────────────
-    status_box.info(f"📥 {len(symbols_to_run)} stock(s) ka data download ho raha hai...")
+def fetch_all_data(universe_df, max_workers=None):
+    """Fetches (and caches) OHLCV history for every symbol in the universe."""
+    max_workers = max_workers or config.MAX_WORKERS
+    start = warmup_start_date()
+    end   = config.BACKTEST_END_DATE
     stock_data_map = {}
-    fetch_errors   = []
+    sector_map = dict(zip(universe_df["tradingsymbol"], universe_df["sector"]))
+    symbols = universe_df["tradingsymbol"].tolist()
 
-    for i, sym in enumerate(symbols_to_run):
-        data = get_historical_data(sym, warmup_start_date(), config.BACKTEST_END_DATE)
-        stock_data_map[sym] = data
-        if data is None or data.empty:
-            fetch_errors.append(sym)
-        pct = int(5 + (i + 1) / len(symbols_to_run) * 30)
-        progress_bar.progress(pct, text=f"Fetch: {i+1}/{len(symbols_to_run)} — {sym}")
+    print(f"[backtester] Fetching historical data for {len(symbols)} symbols "
+          f"({start} -> {end}) using {max_workers} workers...")
 
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(get_historical_data, sym, start, end): sym for sym in symbols}
+        done = 0
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                data = future.result()
+            except Exception as e:
+                print(f"[backtester] {sym}: fetch error {e}")
+                data = None
+            stock_data_map[sym] = data
+            done += 1
+            if done % 25 == 0 or done == len(symbols):
+                print(f"[backtester] ...{done}/{len(symbols)} fetched")
+
+    return stock_data_map, sector_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_backtest(min_conditions=None, max_workers=None, run_optimizations=False,
+                 target1_mult=None, target2_mult=None, stop_mult=None, max_hold=None):
+
+    t0 = time.time()
+    min_conditions = min_conditions or config.DEFAULT_MIN_CONDITIONS
+
+    universe_df = load_universe()
+    stock_data_map, sector_map = fetch_all_data(universe_df, max_workers=max_workers)
     valid_data = {k: v for k, v in stock_data_map.items() if v is not None and not v.empty}
+    print(f"[backtester] {len(valid_data)}/{len(stock_data_map)} symbols have usable data.")
 
-    if fetch_errors:
-        st.warning(f"⚠️ Fetch nahi hue (delisted/galat naam?): {', '.join(fetch_errors)}")
-    if not valid_data:
-        st.error("❌ Kisi bhi stock ka data nahi mila. NSE exact symbol name check karo.")
-        st.stop()
+    print(f"[backtester] Generating signals (no look-ahead) — threshold>="
+          f"{config.THRESHOLD_SWEEP[0]} for optimization headroom...")
 
-    # ── Step 2: Signals ───────────────────────────────────────────────────────
-    status_box.info(f"✅ {len(valid_data)} stock(s) ka data mila. Signals generate ho rahe hain...")
-    progress_bar.progress(35, text="Signals generate ho rahe hain...")
-
-    sym_sector     = dict(zip(universe_df["tradingsymbol"].str.upper(), universe_df["sector"]))
     base_threshold = min(config.THRESHOLD_SWEEP + [min_conditions])
-    all_signals    = generate_all_signals(valid_data, min_conditions=base_threshold, sector_map=sym_sector)
+    all_signals    = generate_all_signals(valid_data, min_conditions=base_threshold,
+                                         sector_map=sector_map)
+    print(f"[backtester] {len(all_signals)} raw signal-days at threshold>={base_threshold}.")
+
     active_signals = all_signals[all_signals["ConditionsMet"] >= min_conditions]
+    print(f"[backtester] {len(active_signals)} signals at active threshold ({min_conditions}/16).")
 
-    # ── Step 3: Trades ────────────────────────────────────────────────────────
-    progress_bar.progress(60, text="Trades simulate ho rahe hain...")
-    status_box.info(f"📊 {len(active_signals)} signals mile. Trades simulate ho rahe hain...")
+    trades_df = execute_trades(active_signals, valid_data,
+                               target1_mult=target1_mult,
+                               target2_mult=target2_mult,
+                               stop_mult=stop_mult,
+                               max_hold=max_hold)
+    print(f"[backtester] {len(trades_df)} trades simulated.")
 
-    trades_df = execute_trades(
-        active_signals, valid_data,
-        target1_mult=target1_mult, target2_mult=target2_mult,
-        stop_mult=stop_mult, max_hold=int(max_hold),
-    )
-
-    # ── Step 4: Metrics ───────────────────────────────────────────────────────
-    progress_bar.progress(75, text="Metrics calculate ho rahe hain...")
-    equity_df    = build_equity_curve(trades_df, starting_capital=float(capital), risk_pct=risk_per_trade_pct)
-    summary      = performance_summary(trades_df, equity_df, starting_capital=float(capital))
+    equity_df    = build_equity_curve(trades_df)
+    summary      = performance_summary(trades_df, equity_df)
     monthly_df   = monthly_analysis(trades_df)
     yearly_df    = yearly_analysis(trades_df)
     sector_df    = sector_analysis(trades_df)
     condition_df = condition_analysis(trades_df)
 
-    # ── Step 5: Output files ──────────────────────────────────────────────────
-    progress_bar.progress(85, text="Files likh rahe hain...")
+    # NEW: best condition combinations (pairs by default)
+    print("[backtester] Computing best condition combinations...")
+    condition_combos_df = best_condition_combos(trades_df, min_trades=5, top_n=20, combo_size=2)
+    if not condition_combos_df.empty:
+        print(f"[backtester] Top combo: {condition_combos_df.iloc[0]['Conditions']} "
+              f"WR={condition_combos_df.iloc[0]['WinRate_%']:.1f}% "
+              f"N={int(condition_combos_df.iloc[0]['Trades'])}")
+
+    # Optimizations (only if requested)
+    threshold_df, best_threshold = pd.DataFrame(), None
+    atr_df,       best_atr       = pd.DataFrame(), None
+    holding_df,   best_holding   = pd.DataFrame(), None
+    sensitivity_df               = pd.DataFrame()
+
+    if run_optimizations:
+        print("[backtester] Running threshold analysis...")
+        threshold_df, best_threshold = threshold_analysis(all_signals, valid_data)
+
+        print("[backtester] Running ATR multiplier optimization...")
+        atr_df, best_atr = atr_optimization(active_signals, valid_data)
+
+        print("[backtester] Running holding period optimization...")
+        holding_df, best_holding = holding_period_optimization(active_signals, valid_data)
+
+        print("[backtester] Running sensitivity analysis (can be slow)...")
+        sensitivity_df = sensitivity_analysis(all_signals, valid_data)
+
+        summary["RecommendedThreshold"]    = f"{best_threshold}/16" if best_threshold else "N/A"
+        summary["RecommendedATRMultiplier"] = best_atr
+        summary["RecommendedHoldingDays"]   = best_holding
+
+    # Drawdown series
     drawdown_df = pd.DataFrame()
     if not equity_df.empty:
         from metrics import compute_drawdown
         drawdown_df = compute_drawdown(equity_df["Equity"]).to_frame(name="Drawdown_%")
 
-    excel_path = write_excel_report(
-        summary, trades_df, monthly_df, yearly_df,
-        condition_df, sector_df, equity_df, drawdown_df,
-        pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    )
-    write_csv_outputs(trades_df, equity_df, monthly_df, condition_df, sector_df)
-    write_performance_json(summary)
+    print("[backtester] Writing output files...")
 
-    progress_bar.progress(95, text="Charts ban rahe hain...")
-    try:
-        generate_all_charts(equity_df, trades_df, monthly_df, sector_df, condition_df, pd.DataFrame())
-    except Exception:
-        pass
+    excel_path = write_excel_report(
+        summary, trades_df, monthly_df, yearly_df, condition_df,
+        sector_df, equity_df, drawdown_df, threshold_df, atr_df, holding_df,
+        condition_combos_df=condition_combos_df,   # NEW
+    )
+
+    csv_paths = write_csv_outputs(
+        trades_df, equity_df, monthly_df, condition_df, sector_df,
+        condition_combos_df=condition_combos_df,   # NEW
+    )
+
+    json_path   = write_performance_json(summary)
+    chart_paths = generate_all_charts(equity_df, trades_df, monthly_df,
+                                      sector_df, condition_df, threshold_df)
 
     elapsed = time.time() - t0
-    progress_bar.progress(100, text=f"✅ Done! ({elapsed:.1f}s mein)")
-    status_box.success(f"✅ Backtest complete! {elapsed:.1f} seconds mein hua.")
+    print(f"[backtester] Done in {elapsed:.1f}s")
+    print(f"[backtester] Excel  → {excel_path}")
+    print(f"[backtester] CSVs   → {csv_paths}")
+    print(f"[backtester] JSON   → {json_path}")
+    print(f"[backtester] Charts → {list(chart_paths.values())}")
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # RESULTS
-    # ═════════════════════════════════════════════════════════════════════════
-    st.markdown("---")
-    st.subheader("📊 Performance Summary")
+    return {
+        "summary":          summary,
+        "trades":           trades_df,
+        "signals":          all_signals,
+        "monthly":          monthly_df,
+        "yearly":           yearly_df,
+        "sector":           sector_df,
+        "condition":        condition_df,
+        "condition_combos": condition_combos_df,   # NEW
+        "threshold":        threshold_df,
+        "atr":              atr_df,
+        "holding":          holding_df,
+        "sensitivity":      sensitivity_df,
+        "equity":           equity_df,
+        "files": {
+            "excel":  excel_path,
+            "csv":    csv_paths,
+            "json":   json_path,
+            "charts": chart_paths,
+        },
+    }
 
-    if not trades_df.empty:
 
-        # ── Row 1: Trade counts ───────────────────────────────────────────────
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("📦 Total Trades",   summary.get("TotalTrades", 0))
-        c2.metric("✅ Winning Trades",  summary.get("WinningTrades", 0))
-        c3.metric("❌ Losing Trades",   summary.get("LosingTrades", 0))
-        c4.metric("🎯 Win Rate",        f"{summary.get('WinRate_%', 0):.1f}%")
-        c5.metric("📈 Avg Return",      f"{summary.get('AverageReturn_%', 0):.2f}%")
+# ─────────────────────────────────────────────────────────────────────────────
 
-        # ── Row 2: Risk ───────────────────────────────────────────────────────
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("⚖️ Profit Factor",  f"{summary.get('ProfitFactor', 0):.2f}")
-        c2.metric("📉 Max Drawdown",   f"{summary.get('MaxDrawdown_%', 0):.2f}%")
-        c3.metric("📊 Sharpe Ratio",   f"{summary.get('SharpeRatio', 0):.2f}")
-        c4.metric("🔻 Sortino Ratio",  f"{summary.get('SortinoRatio', 0):.2f}")
-        c5.metric("📆 Avg Hold Days",  f"{summary.get('AverageHoldingDays', 0):.1f}")
+def _parse_args():
+    p = argparse.ArgumentParser(description="Upstox Elite Swing Scanner Backtester")
+    p.add_argument("--min-conditions", type=int, default=config.DEFAULT_MIN_CONDITIONS,
+                   help="Minimum conditions (10-16) required to generate a trade")
+    p.add_argument("--max-workers",    type=int, default=config.MAX_WORKERS)
+    p.add_argument("--full-optimization", action="store_true",
+                   help="Also run threshold/ATR/holding-period/sensitivity sweeps")
+    p.add_argument("--target1-mult",   type=float, default=None)
+    p.add_argument("--target2-mult",   type=float, default=None)
+    p.add_argument("--stop-mult",      type=float, default=None)
+    p.add_argument("--max-hold",       type=int,   default=None)
+    return p.parse_args()
 
-        # ── Row 3: Returns ────────────────────────────────────────────────────
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("🏆 Largest Winner", f"{summary.get('LargestWinner_%', 0):.2f}%")
-        c2.metric("💀 Largest Loser",  f"{summary.get('LargestLoser_%', 0):.2f}%")
-        c3.metric("📊 Avg Win",        f"{summary.get('AverageWin_%', 0):.2f}%")
-        c4.metric("📊 Avg Loss",       f"{summary.get('AverageLoss_%', 0):.2f}%")
-        c5.metric("📆 CAGR",           f"{summary.get('CAGR_%', 0):.2f}%")
 
-        st.markdown("---")
-
-        # ── Expectancy + Position Sizing side by side ─────────────────────────
-        exp_col, pos_col = st.columns(2)
-
-        # -- Expectancy --------------------------------------------------------
-        with exp_col:
-            st.subheader("🎯 Expectancy per Trade")
-            expectancy    = summary.get("Expectancy_%", 0)
-            win_rate_dec  = summary.get("WinningTrades", 0) / max(summary.get("TotalTrades", 1), 1)
-            loss_rate_dec = 1 - win_rate_dec
-            avg_win       = summary.get("AverageWin_%", 0)
-            avg_loss      = abs(summary.get("AverageLoss_%", 0))
-            exp_color     = "🟢" if expectancy > 0 else "🔴"
-
-            st.metric(
-                label=f"{exp_color} Expected Return per Trade",
-                value=f"{expectancy:.3f}%",
-            )
-            st.code(
-                f"Formula:\n"
-                f"Expectancy = (Win% × AvgWin) − (Loss% × AvgLoss)\n"
-                f"           = ({win_rate_dec:.1%} × {avg_win:.2f}%) − ({loss_rate_dec:.1%} × {avg_loss:.2f}%)\n"
-                f"           = {expectancy:.3f}%",
-                language="text"
-            )
-            if expectancy > 0:
-                st.success("✅ Positive expectancy — system long run mein profitable hai.")
-            elif expectancy == 0:
-                st.warning("⚠️ Breakeven — costs cover nahi ho rahe.")
-            else:
-                st.error("❌ Negative expectancy — threshold ya parameters adjust karo.")
-
-        # -- Position Sizing ---------------------------------------------------
-        with pos_col:
-            st.subheader("💰 Position Sizing Recommendation")
-            risk_rs    = capital * (risk_per_trade_pct / 100.0)
-            kelly_f    = win_rate_dec - (loss_rate_dec / (avg_win / max(avg_loss, 0.01)))
-            kelly_f    = max(0.0, kelly_f)
-            half_kelly = kelly_f / 2.0
-
-            st.markdown(f"**Capital:** ₹{capital:,.0f} &nbsp;|&nbsp; **Risk/Trade:** {risk_per_trade_pct}%")
-            st.markdown(f"**Risk Amount per Trade:** ₹{risk_rs:,.0f}")
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Kelly %",       f"{kelly_f*100:.1f}%")
-            m2.metric("Half-Kelly %",  f"{half_kelly*100:.1f}%")
-            m3.metric("Fixed Risk %",  f"{risk_per_trade_pct}%")
-
-            st.markdown(f"""
-| Strategy | Amount per Trade |
-|---|---|
-| Full Kelly | ₹{capital*kelly_f:,.0f} |
-| Half Kelly ✅ | ₹{capital*half_kelly:,.0f} |
-| Fixed {risk_per_trade_pct}% Risk | ₹{risk_rs:,.0f} risk |
-""")
-            if kelly_f > 0:
-                st.info("💡 Half-Kelly recommended — safer for real trading.")
-            else:
-                st.warning("⚠️ Kelly negative — current params pe caution rakhein.")
-
-        # ── Exit breakdown ────────────────────────────────────────────────────
-        st.markdown("---")
-        st.subheader("🚪 Exit Reason Breakdown")
-        exit_counts  = trades_df["ExitReason"].value_counts().reset_index()
-        exit_counts.columns = ["Exit Reason", "Count"]
-        exit_counts["% of Trades"] = (exit_counts["Count"] / len(trades_df) * 100).round(1).astype(str) + "%"
-        avg_by_exit  = trades_df.groupby("ExitReason")["ReturnPct"].mean().round(2).reset_index()
-        avg_by_exit.columns = ["Exit Reason", "Avg Return %"]
-        exit_summary = exit_counts.merge(avg_by_exit, on="Exit Reason")
-        st.dataframe(exit_summary, use_container_width=True, hide_index=True)
-
-        # ── Per-stock summary (only if multiple stocks) ───────────────────────
-        if len(symbols_to_run) > 1:
-            st.markdown("---")
-            st.subheader("📋 Per-Stock Summary")
-            per_stock = trades_df.groupby("Ticker").agg(
-                Trades     =("ReturnPct", "count"),
-                WinRate    =("ReturnPct", lambda x: f"{(x > 0).mean()*100:.1f}%"),
-                AvgReturn  =("ReturnPct", lambda x: f"{x.mean():.2f}%"),
-                TotalReturn=("ReturnPct", lambda x: f"{x.sum():.2f}%"),
-                BestTrade  =("ReturnPct", lambda x: f"{x.max():.2f}%"),
-                WorstTrade =("ReturnPct", lambda x: f"{x.min():.2f}%"),
-            ).reset_index()
-            st.dataframe(per_stock, use_container_width=True, hide_index=True)
-
-        # ── Trade-wise position sizing table ──────────────────────────────────
-        st.markdown("---")
-        st.subheader("💰 Trade-wise Position Sizing")
-        sizing_df = position_sizing_recommendation(trades_df, capital, risk_per_trade_pct, stop_mult)
-        if not sizing_df.empty:
-            st.dataframe(
-                sizing_df.style.format({
-                    "EntryPrice":       "₹{:.2f}",
-                    "Stoploss":         "₹{:.2f}",
-                    "Target1":          "₹{:.2f}",
-                    "Target2":          "₹{:.2f}",
-                    "StopDistance_Rs":  "₹{:.2f}",
-                    "RiskAmount_Rs":    "₹{:.0f}",
-                    "PositionValue_Rs": "₹{:.0f}",
-                    "CapitalUsed_%":    "{:.1f}%",
-                    "ReturnPct":        "{:.2f}%",
-                }),
-                use_container_width=True,
-                height=350,
-            )
-
-        # ── Full Trade log ────────────────────────────────────────────────────
-        st.markdown("---")
-        st.subheader("📋 Full Trade Log")
-        display_cols = ["Ticker", "SignalDate", "EntryDate", "EntryPrice",
-                        "ExitDate", "ExitPrice", "ExitReason", "ReturnPct",
-                        "HoldingDays", "ConditionsMet"]
-        show_cols = [c for c in display_cols if c in trades_df.columns]
-        # pandas 3.x: use .map() not .applymap()
-        styled = (
-            trades_df[show_cols]
-            .style
-            .format({
-                "ReturnPct":  "{:.2f}%",
-                "EntryPrice": "₹{:.2f}",
-                "ExitPrice":  "₹{:.2f}",
-            })
-            .map(_colour_return, subset=["ReturnPct"])
-        )
-        st.dataframe(styled, use_container_width=True, height=400)
-
-        # ── Equity curve ──────────────────────────────────────────────────────
-        if not equity_df.empty and "Equity" in equity_df.columns:
-            st.markdown("---")
-            st.subheader("📈 Equity Curve")
-            st.line_chart(equity_df["Equity"])
-
-        # ── Monthly returns ───────────────────────────────────────────────────
-        if not monthly_df.empty:
-            st.subheader("📅 Monthly Returns")
-            st.dataframe(monthly_df, use_container_width=True)
-
-    else:
-        st.warning("⚠️ Koi trade simulate nahi hua. Threshold kam karo ya alag stocks try karo.")
-
-    # ── Download buttons ──────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("⬇️ Download")
-    dl1, dl2 = st.columns(2)
-
-    with dl1:
-        try:
-            with open(excel_path, "rb") as f:
-                st.download_button(
-                    label="📥 Excel Report Download Karo",
-                    data=f.read(),
-                    file_name="Backtest_Report.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-        except Exception:
-            st.info("Excel file output/ folder mein save ho gayi hai.")
-
-    with dl2:
-        if not trades_df.empty:
-            st.download_button(
-                label="📥 Trade Log CSV Download Karo",
-                data=trades_df.to_csv(index=False).encode("utf-8"),
-                file_name="Trade_Log.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+if __name__ == "__main__":
+    args = _parse_args()
+    run_backtest(
+        min_conditions=args.min_conditions,
+        max_workers=args.max_workers,
+        run_optimizations=args.full_optimization,
+        target1_mult=args.target1_mult,
+        target2_mult=args.target2_mult,
+        stop_mult=args.stop_mult,
+        max_hold=args.max_hold,
+    )
