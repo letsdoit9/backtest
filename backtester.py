@@ -77,34 +77,38 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("💰 Position Sizing")
-    capital      = st.number_input("Aapka Capital (₹)", value=100000, step=10000, min_value=1000)
+    capital            = st.number_input("Aapka Capital (₹)", value=100000, step=10000, min_value=1000)
     risk_per_trade_pct = st.slider("Risk per Trade (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5,
                                     help="Ek trade mein apne capital ka kitna % risk karoge")
 
     st.markdown("---")
     run_btn = st.button("🚀 Backtest Chalao!", type="primary", use_container_width=True)
 
+# ── Helper: colour ReturnPct column ──────────────────────────────────────────
+def _colour_return(val):
+    """Pandas Styler map function — green for positive, red for negative."""
+    try:
+        num = float(str(val).replace("%", "").replace("₹", "").strip())
+        if num > 0:
+            return "color: green; font-weight: bold"
+        elif num < 0:
+            return "color: red; font-weight: bold"
+    except Exception:
+        pass
+    return ""
+
 # ── Helper: Position Sizing ───────────────────────────────────────────────────
-def position_sizing_recommendation(trades_df, capital, risk_pct, stop_mult_val):
-    """
-    Har trade ke liye recommended position size calculate karta hai.
-    Formula: Position Size = (Capital × Risk%) / (ATR × Stop Multiplier)
-    """
+def position_sizing_recommendation(trades_df, cap, risk_pct, sl_mult):
     if trades_df.empty:
         return pd.DataFrame()
-
     df = trades_df.copy()
-    risk_amount   = capital * (risk_pct / 100.0)                          # ₹ mein kitna risk
-    df["RiskAmount_Rs"]    = round(risk_amount, 2)
-    df["StopDistance_Rs"]  = round(df["EntryPrice"] * df["ATR"] / df["EntryPrice"] * stop_mult_val, 4)
-    # Actual stop distance = EntryPrice - Stoploss
-    df["StopDistance_Rs"]  = round(df["EntryPrice"] - df["Stoploss"], 4)
-    df["StopDistance_Rs"]  = df["StopDistance_Rs"].replace(0, np.nan)
-
-    df["RecommendedQty"]   = np.floor(risk_amount / df["StopDistance_Rs"]).fillna(0).astype(int)
-    df["PositionValue_Rs"] = round(df["RecommendedQty"] * df["EntryPrice"], 2)
-    df["CapitalUsed_%"]    = round(df["PositionValue_Rs"] / capital * 100.0, 2)
-
+    risk_amount           = cap * (risk_pct / 100.0)
+    df["StopDistance_Rs"] = (df["EntryPrice"] - df["Stoploss"]).round(2)
+    df["StopDistance_Rs"] = df["StopDistance_Rs"].replace(0, np.nan)
+    df["RiskAmount_Rs"]   = round(risk_amount, 2)
+    df["RecommendedQty"]  = np.floor(risk_amount / df["StopDistance_Rs"]).fillna(0).astype(int)
+    df["PositionValue_Rs"]= (df["RecommendedQty"] * df["EntryPrice"]).round(2)
+    df["CapitalUsed_%"]   = (df["PositionValue_Rs"] / cap * 100.0).round(2)
     return df[["Ticker", "SignalDate", "EntryPrice", "Stoploss", "Target1", "Target2",
                "StopDistance_Rs", "RiskAmount_Rs", "RecommendedQty",
                "PositionValue_Rs", "CapitalUsed_%", "ReturnPct", "ExitReason"]]
@@ -126,19 +130,20 @@ if not run_btn:
     c3.metric("Backtest Start", config.BACKTEST_START_DATE)
 
 else:
-    # Validation
+    # ── Validation ────────────────────────────────────────────────────────────
     if mode == "🎯 Specific stocks chunno" and not selected_symbols:
         st.error("❌ Koi stock select nahi kiya! Pehle sidebar mein stock chunno.")
         st.stop()
 
     symbols_to_run = selected_symbols if mode == "🎯 Specific stocks chunno" else all_symbols
-    st.subheader(f"{'🎯' if selected_symbols else '🌐'} Backtest: {', '.join(symbols_to_run) if len(symbols_to_run) <= 10 else f'{len(symbols_to_run)} stocks'}")
+    label = ', '.join(symbols_to_run) if len(symbols_to_run) <= 10 else f"{len(symbols_to_run)} stocks"
+    st.subheader(f"{'🎯' if selected_symbols else '🌐'} Backtest: {label}")
 
     progress_bar = st.progress(0, text="Shuru ho raha hai...")
     status_box   = st.empty()
     t0           = time.time()
 
-    # Step 1: Data fetch
+    # ── Step 1: Data fetch ────────────────────────────────────────────────────
     status_box.info(f"📥 {len(symbols_to_run)} stock(s) ka data download ho raha hai...")
     stock_data_map = {}
     fetch_errors   = []
@@ -159,7 +164,7 @@ else:
         st.error("❌ Kisi bhi stock ka data nahi mila. NSE exact symbol name check karo.")
         st.stop()
 
-    # Step 2: Signals
+    # ── Step 2: Signals ───────────────────────────────────────────────────────
     status_box.info(f"✅ {len(valid_data)} stock(s) ka data mila. Signals generate ho rahe hain...")
     progress_bar.progress(35, text="Signals generate ho rahe hain...")
 
@@ -168,7 +173,7 @@ else:
     all_signals    = generate_all_signals(valid_data, min_conditions=base_threshold, sector_map=sym_sector)
     active_signals = all_signals[all_signals["ConditionsMet"] >= min_conditions]
 
-    # Step 3: Trades
+    # ── Step 3: Trades ────────────────────────────────────────────────────────
     progress_bar.progress(60, text="Trades simulate ho rahe hain...")
     status_box.info(f"📊 {len(active_signals)} signals mile. Trades simulate ho rahe hain...")
 
@@ -178,7 +183,7 @@ else:
         stop_mult=stop_mult, max_hold=int(max_hold),
     )
 
-    # Step 4: Metrics
+    # ── Step 4: Metrics ───────────────────────────────────────────────────────
     progress_bar.progress(75, text="Metrics calculate ho rahe hain...")
     equity_df    = build_equity_curve(trades_df, starting_capital=float(capital), risk_pct=risk_per_trade_pct)
     summary      = performance_summary(trades_df, equity_df, starting_capital=float(capital))
@@ -187,7 +192,7 @@ else:
     sector_df    = sector_analysis(trades_df)
     condition_df = condition_analysis(trades_df)
 
-    # Step 5: Files
+    # ── Step 5: Output files ──────────────────────────────────────────────────
     progress_bar.progress(85, text="Files likh rahe hain...")
     drawdown_df = pd.DataFrame()
     if not equity_df.empty:
@@ -212,132 +217,125 @@ else:
     progress_bar.progress(100, text=f"✅ Done! ({elapsed:.1f}s mein)")
     status_box.success(f"✅ Backtest complete! {elapsed:.1f} seconds mein hua.")
 
-    # ── RESULTS ───────────────────────────────────────────────────────────────
+    # ═════════════════════════════════════════════════════════════════════════
+    # RESULTS
+    # ═════════════════════════════════════════════════════════════════════════
     st.markdown("---")
     st.subheader("📊 Performance Summary")
 
     if not trades_df.empty:
-        # ── Row 1: Core metrics ───────────────────────────────────────────────
+
+        # ── Row 1: Trade counts ───────────────────────────────────────────────
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("📦 Total Trades",    summary.get("TotalTrades", 0))
-        c2.metric("✅ Winning Trades",   summary.get("WinningTrades", 0))
-        c3.metric("❌ Losing Trades",    summary.get("LosingTrades", 0))
-        win_rate = summary.get("WinRate_%", 0)
-        c4.metric("🎯 Win Rate",        f"{win_rate:.1f}%")
+        c1.metric("📦 Total Trades",   summary.get("TotalTrades", 0))
+        c2.metric("✅ Winning Trades",  summary.get("WinningTrades", 0))
+        c3.metric("❌ Losing Trades",   summary.get("LosingTrades", 0))
+        c4.metric("🎯 Win Rate",        f"{summary.get('WinRate_%', 0):.1f}%")
         c5.metric("📈 Avg Return",      f"{summary.get('AverageReturn_%', 0):.2f}%")
 
-        # ── Row 2: Risk metrics ───────────────────────────────────────────────
+        # ── Row 2: Risk ───────────────────────────────────────────────────────
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("⚖️ Profit Factor",   f"{summary.get('ProfitFactor', 0):.2f}")
-        c2.metric("📉 Max Drawdown",    f"{summary.get('MaxDrawdown_%', 0):.2f}%")
-        c3.metric("📊 Sharpe Ratio",    f"{summary.get('SharpeRatio', 0):.2f}")
-        c4.metric("🔻 Sortino Ratio",   f"{summary.get('SortinoRatio', 0):.2f}")
-        c5.metric("📆 Avg Hold Days",   f"{summary.get('AverageHoldingDays', 0):.1f}")
+        c1.metric("⚖️ Profit Factor",  f"{summary.get('ProfitFactor', 0):.2f}")
+        c2.metric("📉 Max Drawdown",   f"{summary.get('MaxDrawdown_%', 0):.2f}%")
+        c3.metric("📊 Sharpe Ratio",   f"{summary.get('SharpeRatio', 0):.2f}")
+        c4.metric("🔻 Sortino Ratio",  f"{summary.get('SortinoRatio', 0):.2f}")
+        c5.metric("📆 Avg Hold Days",  f"{summary.get('AverageHoldingDays', 0):.1f}")
 
         # ── Row 3: Returns ────────────────────────────────────────────────────
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("🏆 Largest Winner",  f"{summary.get('LargestWinner_%', 0):.2f}%")
-        c2.metric("💀 Largest Loser",   f"{summary.get('LargestLoser_%', 0):.2f}%")
-        c3.metric("📊 Avg Win",         f"{summary.get('AverageWin_%', 0):.2f}%")
-        c4.metric("📊 Avg Loss",        f"{summary.get('AverageLoss_%', 0):.2f}%")
-        c5.metric("📆 CAGR",            f"{summary.get('CAGR_%', 0):.2f}%")
+        c1.metric("🏆 Largest Winner", f"{summary.get('LargestWinner_%', 0):.2f}%")
+        c2.metric("💀 Largest Loser",  f"{summary.get('LargestLoser_%', 0):.2f}%")
+        c3.metric("📊 Avg Win",        f"{summary.get('AverageWin_%', 0):.2f}%")
+        c4.metric("📊 Avg Loss",       f"{summary.get('AverageLoss_%', 0):.2f}%")
+        c5.metric("📆 CAGR",           f"{summary.get('CAGR_%', 0):.2f}%")
 
-        # ── Expectancy Box ────────────────────────────────────────────────────
-        expectancy = summary.get("Expectancy_%", 0)
-        exp_color  = "🟢" if expectancy > 0 else "🔴"
         st.markdown("---")
 
+        # ── Expectancy + Position Sizing side by side ─────────────────────────
         exp_col, pos_col = st.columns(2)
 
+        # -- Expectancy --------------------------------------------------------
         with exp_col:
             st.subheader("🎯 Expectancy per Trade")
-            st.metric(
-                label=f"{exp_color} Expected Return per Trade",
-                value=f"{expectancy:.3f}%",
-                help="Win Rate × Avg Win  −  Loss Rate × Avg Loss. Positive = profitable system"
-            )
-
+            expectancy    = summary.get("Expectancy_%", 0)
             win_rate_dec  = summary.get("WinningTrades", 0) / max(summary.get("TotalTrades", 1), 1)
             loss_rate_dec = 1 - win_rate_dec
             avg_win       = summary.get("AverageWin_%", 0)
             avg_loss      = abs(summary.get("AverageLoss_%", 0))
+            exp_color     = "🟢" if expectancy > 0 else "🔴"
 
-            st.markdown(f"""
-            ```
-            Formula:
-            Expectancy = (Win Rate × Avg Win) − (Loss Rate × Avg Loss)
-                       = ({win_rate_dec:.2%} × {avg_win:.2f}%) − ({loss_rate_dec:.2%} × {avg_loss:.2f}%)
-                       = {expectancy:.3f}%
-            ```
-            """)
-
+            st.metric(
+                label=f"{exp_color} Expected Return per Trade",
+                value=f"{expectancy:.3f}%",
+            )
+            st.code(
+                f"Formula:\n"
+                f"Expectancy = (Win% × AvgWin) − (Loss% × AvgLoss)\n"
+                f"           = ({win_rate_dec:.1%} × {avg_win:.2f}%) − ({loss_rate_dec:.1%} × {avg_loss:.2f}%)\n"
+                f"           = {expectancy:.3f}%",
+                language="text"
+            )
             if expectancy > 0:
-                st.success(f"✅ System positive expectancy hai — long run mein profitable hoga.")
+                st.success("✅ Positive expectancy — system long run mein profitable hai.")
             elif expectancy == 0:
-                st.warning("⚠️ Breakeven system — costs cover nahi ho rahe.")
+                st.warning("⚠️ Breakeven — costs cover nahi ho rahe.")
             else:
                 st.error("❌ Negative expectancy — threshold ya parameters adjust karo.")
 
-        # ── Position Sizing Box ───────────────────────────────────────────────
+        # -- Position Sizing ---------------------------------------------------
         with pos_col:
             st.subheader("💰 Position Sizing Recommendation")
-
             risk_rs    = capital * (risk_per_trade_pct / 100.0)
             kelly_f    = win_rate_dec - (loss_rate_dec / (avg_win / max(avg_loss, 0.01)))
-            kelly_f    = max(0, kelly_f)  # negative Kelly = don't trade
-            half_kelly = kelly_f / 2.0    # Half-Kelly (safer)
+            kelly_f    = max(0.0, kelly_f)
+            half_kelly = kelly_f / 2.0
 
-            st.markdown(f"**Capital:** ₹{capital:,.0f}  |  **Risk/Trade:** {risk_per_trade_pct}%")
+            st.markdown(f"**Capital:** ₹{capital:,.0f} &nbsp;|&nbsp; **Risk/Trade:** {risk_per_trade_pct}%")
             st.markdown(f"**Risk Amount per Trade:** ₹{risk_rs:,.0f}")
 
             m1, m2, m3 = st.columns(3)
-            m1.metric("Kelly %",      f"{kelly_f*100:.1f}%",   help="Full Kelly — theoretical optimal, aggressive")
-            m2.metric("Half-Kelly %", f"{half_kelly*100:.1f}%", help="Half Kelly — practical recommendation")
-            m3.metric("Fixed Risk %", f"{risk_per_trade_pct}%", help="Aapka set kiya hua risk per trade")
-
-            kelly_rs      = capital * kelly_f
-            half_kelly_rs = capital * half_kelly
+            m1.metric("Kelly %",       f"{kelly_f*100:.1f}%")
+            m2.metric("Half-Kelly %",  f"{half_kelly*100:.1f}%")
+            m3.metric("Fixed Risk %",  f"{risk_per_trade_pct}%")
 
             st.markdown(f"""
-            | Strategy | Capital Deploy |
-            |----------|---------------|
-            | Full Kelly | ₹{kelly_rs:,.0f} per trade |
-            | Half Kelly (recommended) | ₹{half_kelly_rs:,.0f} per trade |
-            | Fixed {risk_per_trade_pct}% Risk | ₹{risk_rs:,.0f} risk per trade |
-            """)
-
+| Strategy | Amount per Trade |
+|---|---|
+| Full Kelly | ₹{capital*kelly_f:,.0f} |
+| Half Kelly ✅ | ₹{capital*half_kelly:,.0f} |
+| Fixed {risk_per_trade_pct}% Risk | ₹{risk_rs:,.0f} risk |
+""")
             if kelly_f > 0:
-                st.info(f"💡 **Tip:** Half-Kelly recommend kiya jata hai — Full Kelly ka {50:.0f}% use karo for better risk management.")
+                st.info("💡 Half-Kelly recommended — safer for real trading.")
             else:
-                st.warning("⚠️ Kelly negative hai — current parameters pe trading recommend nahi.")
+                st.warning("⚠️ Kelly negative — current params pe caution rakhein.")
 
-        # ── Exit reason breakdown ─────────────────────────────────────────────
+        # ── Exit breakdown ────────────────────────────────────────────────────
         st.markdown("---")
-        st.subheader("🚪 Exit Breakdown")
-        exit_counts = trades_df["ExitReason"].value_counts().reset_index()
+        st.subheader("🚪 Exit Reason Breakdown")
+        exit_counts  = trades_df["ExitReason"].value_counts().reset_index()
         exit_counts.columns = ["Exit Reason", "Count"]
         exit_counts["% of Trades"] = (exit_counts["Count"] / len(trades_df) * 100).round(1).astype(str) + "%"
-
-        avg_by_exit = trades_df.groupby("ExitReason")["ReturnPct"].mean().round(2).reset_index()
+        avg_by_exit  = trades_df.groupby("ExitReason")["ReturnPct"].mean().round(2).reset_index()
         avg_by_exit.columns = ["Exit Reason", "Avg Return %"]
         exit_summary = exit_counts.merge(avg_by_exit, on="Exit Reason")
         st.dataframe(exit_summary, use_container_width=True, hide_index=True)
 
-        # ── Per-stock summary ─────────────────────────────────────────────────
+        # ── Per-stock summary (only if multiple stocks) ───────────────────────
         if len(symbols_to_run) > 1:
             st.markdown("---")
             st.subheader("📋 Per-Stock Summary")
             per_stock = trades_df.groupby("Ticker").agg(
-                Trades    =("ReturnPct", "count"),
-                WinRate   =("ReturnPct", lambda x: f"{(x > 0).mean()*100:.1f}%"),
-                AvgReturn =("ReturnPct", lambda x: f"{x.mean():.2f}%"),
+                Trades     =("ReturnPct", "count"),
+                WinRate    =("ReturnPct", lambda x: f"{(x > 0).mean()*100:.1f}%"),
+                AvgReturn  =("ReturnPct", lambda x: f"{x.mean():.2f}%"),
                 TotalReturn=("ReturnPct", lambda x: f"{x.sum():.2f}%"),
-                BestTrade =("ReturnPct", lambda x: f"{x.max():.2f}%"),
-                WorstTrade=("ReturnPct", lambda x: f"{x.min():.2f}%"),
+                BestTrade  =("ReturnPct", lambda x: f"{x.max():.2f}%"),
+                WorstTrade =("ReturnPct", lambda x: f"{x.min():.2f}%"),
             ).reset_index()
             st.dataframe(per_stock, use_container_width=True, hide_index=True)
 
-        # ── Position sizing table ─────────────────────────────────────────────
+        # ── Trade-wise position sizing table ──────────────────────────────────
         st.markdown("---")
         st.subheader("💰 Trade-wise Position Sizing")
         sizing_df = position_sizing_recommendation(trades_df, capital, risk_per_trade_pct, stop_mult)
@@ -354,35 +352,37 @@ else:
                     "CapitalUsed_%":    "{:.1f}%",
                     "ReturnPct":        "{:.2f}%",
                 }),
-                use_container_width=True, height=350
+                use_container_width=True,
+                height=350,
             )
 
-        # ── Trade log ─────────────────────────────────────────────────────────
+        # ── Full Trade log ────────────────────────────────────────────────────
         st.markdown("---")
         st.subheader("📋 Full Trade Log")
         display_cols = ["Ticker", "SignalDate", "EntryDate", "EntryPrice",
                         "ExitDate", "ExitPrice", "ExitReason", "ReturnPct",
                         "HoldingDays", "ConditionsMet"]
         show_cols = [c for c in display_cols if c in trades_df.columns]
-        st.dataframe(
-            trades_df[show_cols].style.format({
+        # pandas 3.x: use .map() not .applymap()
+        styled = (
+            trades_df[show_cols]
+            .style
+            .format({
                 "ReturnPct":  "{:.2f}%",
                 "EntryPrice": "₹{:.2f}",
                 "ExitPrice":  "₹{:.2f}",
-            }).applymap(
-                lambda v: "color: green" if isinstance(v, str) and v.endswith("%") and float(v.replace("%","").replace("₹","")) > 0
-                          else ("color: red" if isinstance(v, str) and v.endswith("%") and float(v.replace("%","").replace("₹","")) < 0 else ""),
-                subset=["ReturnPct"]
-            ),
-            use_container_width=True, height=400
+            })
+            .map(_colour_return, subset=["ReturnPct"])
         )
+        st.dataframe(styled, use_container_width=True, height=400)
 
-        # ── Charts ────────────────────────────────────────────────────────────
+        # ── Equity curve ──────────────────────────────────────────────────────
         if not equity_df.empty and "Equity" in equity_df.columns:
             st.markdown("---")
             st.subheader("📈 Equity Curve")
             st.line_chart(equity_df["Equity"])
 
+        # ── Monthly returns ───────────────────────────────────────────────────
         if not monthly_df.empty:
             st.subheader("📅 Monthly Returns")
             st.dataframe(monthly_df, use_container_width=True)
@@ -390,7 +390,7 @@ else:
     else:
         st.warning("⚠️ Koi trade simulate nahi hua. Threshold kam karo ya alag stocks try karo.")
 
-    # ── Download ──────────────────────────────────────────────────────────────
+    # ── Download buttons ──────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("⬇️ Download")
     dl1, dl2 = st.columns(2)
